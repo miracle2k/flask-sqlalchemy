@@ -601,3 +601,27 @@ class SQLAlchemy(object):
             self.__class__.__name__,
             app and self.app.config['SQLALCHEMY_DATABASE_URI'] or None
         )
+
+
+try:
+    from flaskext import script
+    from migrate.versioning import shell
+except ImportError:
+    pass
+else:
+    class Migrate(script.Command):
+
+        capture_all_args = True
+
+        def run(self, all_args):
+            app = _request_ctx_stack.top.app
+
+            optional = {}
+            repository = app.config.get('SQLALCHEMY_MIGRATE_REPOSITORY', False)
+            if repository:
+                optional['repository'] = repository
+
+            shell.main(all_args,
+                       url=app.config['SQLALCHEMY_DATABASE_URI'],
+                       debug=app.config['DEBUG'],
+                       **optional)
