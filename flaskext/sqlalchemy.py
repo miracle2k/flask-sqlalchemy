@@ -611,17 +611,13 @@ except ImportError:
 else:
     class Migrate(script.Command):
 
-        capture_all_args = True
-
-        def run(self, all_args):
-            app = _request_ctx_stack.top.app
-
+        def handle(self, app, prog, name, remaining_args):
             optional = {}
             repository = app.config.get('SQLALCHEMY_MIGRATE_REPOSITORY', False)
             if repository:
                 optional['repository'] = repository
 
-            shell.main(all_args,
+            shell.main(remaining_args,
                        url=app.config['SQLALCHEMY_DATABASE_URI'],
                        debug=app.config['DEBUG'],
                        **optional)
