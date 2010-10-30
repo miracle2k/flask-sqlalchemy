@@ -187,5 +187,21 @@ class PaginationTestCase(unittest.TestCase):
                          [1, 2, None, 8, 9, 10, 11, 12, 13, 14, None, 24, 25])
 
 
+class SQLAlchemyIncludesTestCase(unittest.TestCase):
+
+    def test(self):
+        """Various SQLAlchemy objects are exposed as attributes.
+        """
+        db = sqlalchemy.SQLAlchemy()
+
+        import sqlalchemy as sqlalchemy_lib
+        self.assertTrue(db.Column == sqlalchemy_lib.Column)
+
+        # The Query object we expose is actually our own subclass.
+        from flaskext.sqlalchemy import BaseQuery
+        self.assertTrue(db.Query == BaseQuery)
+
+
+
 if __name__ == '__main__':
     unittest.main()

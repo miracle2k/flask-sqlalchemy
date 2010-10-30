@@ -202,6 +202,10 @@ Configuration
 
 .. autoclass:: SQLAlchemy
    :members:
+   
+   .. attribute:: Query
+
+      The :class:`BaseQuery` class.
 
 Models
 ``````
