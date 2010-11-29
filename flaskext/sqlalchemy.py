@@ -624,6 +624,8 @@ except ImportError:
     pass
 else:
     class Migrate(script.Command):
+        """Manage migrations.
+        """
 
         def handle(self, app, prog, name, remaining_args):
             optional = {}
