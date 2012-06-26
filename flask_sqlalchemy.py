@@ -5,16 +5,17 @@
 
     Adds basic SQLAlchemy support to your application.
 
-    :copyright: (c) 2010 by Armin Ronacher.
+    :copyright: (c) 2012 by Armin Ronacher.
     :license: BSD, see LICENSE for more details.
 """
 from __future__ import with_statement, absolute_import
+import os
 import re
 import sys
 import time
+import functools
 import sqlalchemy
 from math import ceil
-from types import MethodType
 from functools import partial
 from flask import _request_ctx_stack, abort
 from flask.signals import Namespace
@@ -22,13 +23,12 @@ from operator import itemgetter
 from threading import Lock
 from sqlalchemy import orm
 from sqlalchemy.orm.exc import UnmappedClassError
-from sqlalchemy.orm.mapper import Mapper
 from sqlalchemy.orm.session import Session
 from sqlalchemy.orm.interfaces import MapperExtension, SessionExtension, \
      EXT_CONTINUE
 from sqlalchemy.interfaces import ConnectionProxy
 from sqlalchemy.engine.url import make_url
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.ext.declarative import declarative_base, DeclarativeMeta
 from sqlalchemy.util import to_list
 
 # the best timer function for the platform
@@ -36,6 +36,15 @@ if sys.platform == 'win32':
     _timer = time.clock
 else:
     _timer = time.time
+
+try:
+    from flask import _app_ctx_stack
+except ImportError:
+    _app_ctx_stack = None
+
+
+# Which stack should we use?  _app_ctx_stack is new in 0.9
+connection_stack = _app_ctx_stack or _request_ctx_stack
 
 
 _camelcase_re = re.compile(r'([A-Z]+)(?=[a-z0-9])')
@@ -46,8 +55,33 @@ models_committed = _signals.signal('models-committed')
 before_models_committed = _signals.signal('before-models-committed')
 
 
-def _create_scoped_session(db):
-    return orm.scoped_session(partial(_SignallingSession, db))
+def _make_table(db):
+    def _make_table(*args, **kwargs):
+        if len(args) > 1 and isinstance(args[1], db.Column):
+            args = (args[0], db.metadata) + args[1:]
+        info = kwargs.pop('info', None) or {}
+        info.setdefault('bind_key', None)
+        kwargs['info'] = info
+        return sqlalchemy.Table(*args, **kwargs)
+    return _make_table
+
+
+def _set_default_query_class(d):
+    if 'query_class' not in d:
+        d['query_class'] = BaseQuery
+
+
+def _wrap_with_default_query_class(fn):
+    @functools.wraps(fn)
+    def newfn(*args, **kwargs):
+        _set_default_query_class(kwargs)
+        if "backref" in kwargs:
+            backref = kwargs['backref']
+            if isinstance(backref, basestring):
+                backref = (backref, {})
+            _set_default_query_class(backref[1])
+        return fn(*args, **kwargs)
+    return newfn
 
 
 def _include_sqlalchemy(obj):
@@ -55,6 +89,12 @@ def _include_sqlalchemy(obj):
         for key in module.__all__:
             if not hasattr(obj, key):
                 setattr(obj, key, getattr(module, key))
+    # Note: obj.Table does not attempt to be a SQLAlchemy Table class.
+    obj.Table = _make_table(obj)
+    obj.mapper = signalling_mapper
+    obj.relationship = _wrap_with_default_query_class(obj.relationship)
+    obj.relation = _wrap_with_default_query_class(obj.relation)
+    obj.dynamic_loader = _wrap_with_default_query_class(obj.dynamic_loader)
 
 
 class _DebugQueryTuple(tuple):
@@ -103,7 +143,7 @@ class _ConnectionDebugProxy(ConnectionProxy):
         try:
             return execute(cursor, statement, parameters, context)
         finally:
-            ctx = _request_ctx_stack.top
+            ctx = connection_stack.top
             if ctx is not None:
                 queries = getattr(ctx, 'sqlalchemy_queries', None)
                 if queries is None:
@@ -131,15 +171,6 @@ class _SignalTrackingMapperExtension(MapperExtension):
         return EXT_CONTINUE
 
 
-class _SignalTrackingMapper(Mapper):
-
-    def __init__(self, *args, **kwargs):
-        extensions = to_list(kwargs.pop('extension', None), [])
-        extensions.append(_SignalTrackingMapperExtension())
-        kwargs['extension'] = extensions
-        Mapper.__init__(self, *args, **kwargs)
-
-
 class _SignallingSessionExtension(SessionExtension):
 
     def before_commit(self, session):
@@ -162,12 +193,23 @@ class _SignallingSessionExtension(SessionExtension):
 
 class _SignallingSession(Session):
 
-    def __init__(self, db):            
-        Session.__init__(self, autocommit=False, autoflush=False,
-                         extension=db.session_extensions,
-                         bind=db.engine)
-        self.app = db.app or _request_ctx_stack.top.app
+    def __init__(self, db, autocommit=False, autoflush=False, **options):
+        self.app = db.get_app()
         self._model_changes = {}
+        Session.__init__(self, autocommit=autocommit, autoflush=autoflush,
+                         extension=db.session_extensions,
+                         bind=db.engine,
+                         binds=db.get_binds(self.app), **options)
+
+    def get_bind(self, mapper, clause=None):
+        # mapper is None if someone tries to just get a connection
+        if mapper is not None:
+            info = getattr(mapper.mapped_table, 'info', {})
+            bind_key = info.get('bind_key')
+            if bind_key is not None:
+                state = get_state(self.app)
+                return state.db.get_engine(self.app, bind=bind_key)
+        return Session.get_bind(self, mapper, clause)
 
 
 def get_debug_queries():
@@ -177,7 +219,7 @@ def get_debug_queries():
     one expected on errors or in unittesting.  If you don't want to enable
     the DEBUG mode for your unittests you can also enable the query
     recording by setting the ``'SQLALCHEMY_RECORD_QUERIES'`` config variable
-    to `True`.  This is automatically enablde if Flask is in testing mode.
+    to `True`.  This is automatically enabled if Flask is in testing mode.
 
     The value returned will be a list of named tuples with the following
     attributes:
@@ -202,7 +244,7 @@ def get_debug_queries():
         query was issued.  The exact format is undefined so don't try
         to reconstruct filename or function name.
     """
-    return getattr(_request_ctx_stack.top, 'sqlalchemy_queries', [])
+    return getattr(connection_stack.top, 'sqlalchemy_queries', [])
 
 
 class Pagination(object):
@@ -301,7 +343,8 @@ class Pagination(object):
 
 
 class BaseQuery(orm.Query):
-    """The default query object used for models.  This can be subclassed and
+    """The default query object used for models, and exposed as
+    :attr:`~SQLAlchemy.Query`. This can be subclassed and
     replaced for individual models by setting the :attr:`~Model.query_class`
     attribute.  This is a subclass of a standard SQLAlchemy
     :class:`~sqlalchemy.orm.query.Query` class and has all the methods of a
@@ -366,16 +409,26 @@ def _record_queries(app):
 
 class _EngineConnector(object):
 
-    def __init__(self, sa, app):
+    def __init__(self, sa, app, bind=None):
         self._sa = sa
         self._app = app
         self._engine = None
         self._connected_for = None
+        self._bind = bind
         self._lock = Lock()
+
+    def get_uri(self):
+        if self._bind is None:
+            return self._app.config['SQLALCHEMY_DATABASE_URI']
+        binds = self._app.config.get('SQLALCHEMY_BINDS') or ()
+        assert self._bind in binds, \
+            'Bind %r is not specified.  Set it in the SQLALCHEMY_BINDS ' \
+            'configuration variable' % self._bind
+        return binds[self._bind]
 
     def get_engine(self):
         with self._lock:
-            uri = self._app.config['SQLALCHEMY_DATABASE_URI']
+            uri = self.get_uri()
             echo = self._app.config['SQLALCHEMY_ECHO']
             if (uri, echo) == self._connected_for:
                 return self._engine
@@ -392,19 +445,63 @@ class _EngineConnector(object):
             return rv
 
 
-class _ModelTableNameDescriptor(object):
+def _defines_primary_key(d):
+    """Figures out if the given dictonary defines a primary key column."""
+    return any(v.primary_key for k, v in d.iteritems()
+               if isinstance(v, sqlalchemy.Column))
 
-    def __get__(self, obj, type):
-        tablename = type.__dict__.get('__tablename__')
-        if not tablename:
+
+class _BoundDeclarativeMeta(DeclarativeMeta):
+
+    def __new__(cls, name, bases, d):
+        tablename = d.get('__tablename__')
+
+        # generate a table name automatically if it's missing and the
+        # class dictionary declares a primary key.  We cannot always
+        # attach a primary key to support model inheritance that does
+        # not use joins.  We also don't want a table name if a whole
+        # table is defined
+        if not tablename and d.get('__table__') is None and \
+           _defines_primary_key(d):
             def _join(match):
                 word = match.group()
                 if len(word) > 1:
                     return ('_%s_%s' % (word[:-1], word[-1])).lower()
                 return '_' + word.lower()
-            tablename = _camelcase_re.sub(_join, type.__name__).lstrip('_')
-            setattr(type, '__tablename__', tablename)
-        return tablename
+            d['__tablename__'] = _camelcase_re.sub(_join, name).lstrip('_')
+
+        return DeclarativeMeta.__new__(cls, name, bases, d)
+
+    def __init__(self, name, bases, d):
+        bind_key = d.pop('__bind_key__', None)
+        DeclarativeMeta.__init__(self, name, bases, d)
+        if bind_key is not None:
+            self.__table__.info['bind_key'] = bind_key
+
+
+def get_state(app):
+    """Gets the state for the application"""
+    assert 'sqlalchemy' in app.extensions, \
+        'The sqlalchemy extension was not registered to the current ' \
+        'application.  Please make sure to call init_app() first.'
+    return app.extensions['sqlalchemy']
+
+
+def signalling_mapper(*args, **kwargs):
+    """Replacement for mapper that injects some extra extensions"""
+    extensions = to_list(kwargs.pop('extension', None), [])
+    extensions.append(_SignalTrackingMapperExtension())
+    kwargs['extension'] = extensions
+    return sqlalchemy.orm.mapper(*args, **kwargs)
+
+
+class _SQLAlchemyState(object):
+    """Remembers configuration for the (db, app) tuple."""
+
+    def __init__(self, db, app):
+        self.db = db
+        self.app = app
+        self.connectors = {}
 
 
 class Model(object):
@@ -417,11 +514,6 @@ class Model(object):
     #: an instance of :attr:`query_class`.  Can be used to query the
     #: database for instances of this model.
     query = None
-
-    #: arguments for the mapper
-    __mapper_cls__ = _SignalTrackingMapper
-
-    __tablename__ = _ModelTableNameDescriptor()
 
 
 class SQLAlchemy(object):
@@ -459,43 +551,72 @@ class SQLAlchemy(object):
     key) to `False`.  Note that the configuration key overrides the
     value you pass to the constructor.
 
-    Additionally this class also provides access to all the SQLAlchemy
-    functions from the :mod:`sqlalchemy` and :mod:`sqlalchemy.orm` modules.
-    So you can declare models like this::
+    This class also provides access to all the SQLAlchemy functions and classes
+    from the :mod:`sqlalchemy` and :mod:`sqlalchemy.orm` modules.  So you can
+    declare models like this::
 
         class User(db.Model):
             username = db.Column(db.String(80), unique=True)
             pw_hash = db.Column(db.String(80))
-            
+
+    You can still use :mod:`sqlalchemy` and :mod:`sqlalchemy.orm` directly, but
+    note that Flask-SQLAlchemy customizations are available only through an
+    instance of this :class:`SQLAlchemy` class.  Query classes default to
+    :class:`BaseQuery` for `db.Query`, `db.Model.query_class`, and the default
+    query_class for `db.relationship` and `db.backref`.  If you use these
+    interfaces through :mod:`sqlalchemy` and :mod:`sqlalchemy.orm` directly,
+    the default query class will be that of :mod:`sqlalchemy`.
+
+    .. admonition:: Check types carefully
+
+       Don't perform type or `isinstance` checks against `db.Table`, which
+       emulates `Table` behavior but is not a class. `db.Table` exposes the
+       `Table` interface, but is a function which allows omission of metadata.
+
     You may also define your own SessionExtension instances as well when
     defining your SQLAlchemy class instance. You may pass your custom instances
-    to the `session_extensions` keyword. This can be either a single 
-    SessionExtension instance, or a list of SessionExtension instances. In the 
-    following use case we use the VersionedListener from the SQLAlchemy 
+    to the `session_extensions` keyword. This can be either a single
+    SessionExtension instance, or a list of SessionExtension instances. In the
+    following use case we use the VersionedListener from the SQLAlchemy
     versioning examples.::
-    
+
         from history_meta import VersionedMeta, VersionedListener
-        
+
         app = Flask(__name__)
         db = SQLAlchemy(app, session_extensions=[VersionedListener()])
-        
+
         class User(db.Model):
             __metaclass__ = VersionedMeta
             username = db.Column(db.String(80), unique=True)
             pw_hash = db.Column(db.String(80))
+
+    The `session_options` parameter can be used to override session
+    options.  If provided it's a dict of parameters passed to the
+    session's constructor.
+
+    .. versionadded:: 0.10
+       The `session_options` parameter was added.
+
+    .. versionadded:: 0.16
+       `scopefunc` is now accepted on `session_options`. It allows specifying
+        a custom function which will define the SQLAlchemy session's scoping.
     """
 
-    def __init__(self, app=None, use_native_unicode=True, 
-                 session_extensions=None):
+    def __init__(self, app=None, use_native_unicode=True,
+                 session_extensions=None, session_options=None):
         self.use_native_unicode = use_native_unicode
         self.session_extensions = to_list(session_extensions, []) + \
                                   [_SignallingSessionExtension()]
-        
-        self.session = _create_scoped_session(self)
 
-        self.Model = declarative_base(cls=Model, name='Model')
-        self.Model.query = _QueryProperty(self)
+        if session_options is None:
+            session_options = {}
 
+        session_options.setdefault(
+            'scopefunc', connection_stack.__ident_func__
+        )
+
+        self.session = self.create_scoped_session(session_options)
+        self.Model = self.make_declarative_base()
         self._engine_lock = Lock()
 
         if app is not None:
@@ -505,11 +626,29 @@ class SQLAlchemy(object):
             self.app = None
 
         _include_sqlalchemy(self)
+        self.Query = BaseQuery
 
     @property
     def metadata(self):
         """Returns the metadata"""
         return self.Model.metadata
+
+    def create_scoped_session(self, options=None):
+        """Helper factory method that creates a scoped session."""
+        if options is None:
+            options = {}
+        scopefunc=options.pop('scopefunc', None)
+        return orm.scoped_session(
+            partial(_SignallingSession, self, **options), scopefunc=scopefunc
+        )
+
+    def make_declarative_base(self):
+        """Creates the declarative base."""
+        base = declarative_base(cls=Model, name='Model',
+                                mapper=signalling_mapper,
+                                metaclass=_BoundDeclarativeMeta)
+        base.query = _QueryProperty(self)
+        return base
 
     def init_app(self, app):
         """This callback can be used to initialize an application for the
@@ -518,6 +657,7 @@ class SQLAlchemy(object):
         leak.
         """
         app.config.setdefault('SQLALCHEMY_DATABASE_URI', 'sqlite://')
+        app.config.setdefault('SQLALCHEMY_BINDS', None)
         app.config.setdefault('SQLALCHEMY_NATIVE_UNICODE', None)
         app.config.setdefault('SQLALCHEMY_ECHO', False)
         app.config.setdefault('SQLALCHEMY_RECORD_QUERIES', None)
@@ -525,7 +665,21 @@ class SQLAlchemy(object):
         app.config.setdefault('SQLALCHEMY_POOL_TIMEOUT', None)
         app.config.setdefault('SQLALCHEMY_POOL_RECYCLE', None)
 
-        @app.after_request
+        if not hasattr(app, 'extensions'):
+            app.extensions = {}
+        app.extensions['sqlalchemy'] = _SQLAlchemyState(self, app)
+
+        # 0.9 and later
+        if hasattr(app, 'teardown_appcontext'):
+            teardown = app.teardown_appcontext
+        # 0.7 to 0.8
+        elif hasattr(app, 'teardown_request'):
+            teardown = app.teardown_request
+        # Older Flask versions
+        else:
+            teardown = app.after_request
+
+        @teardown
         def shutdown_session(response):
             self.session.remove()
             return response
@@ -540,15 +694,26 @@ class SQLAlchemy(object):
         _setdefault('pool_recycle', 'SQLALCHEMY_POOL_RECYCLE')
 
     def apply_driver_hacks(self, app, info, options):
+        """This method is called before engine creation and used to inject
+        driver specific hacks into the options.  The `options` parameter is
+        a dictionary of keyword arguments that will then be used to call
+        the :func:`sqlalchemy.create_engine` function.
+
+        The default implementation provides some saner defaults for things
+        like pool sizes for MySQL and sqlite.  Also it injects the setting of
+        `SQLALCHEMY_NATIVE_UNICODE`.
+        """
         if info.drivername == 'mysql':
             info.query.setdefault('charset', 'utf8')
             options.setdefault('pool_size', 10)
             options.setdefault('pool_recycle', 7200)
         elif info.drivername == 'sqlite':
             pool_size = options.get('pool_size')
+            detected_in_memory = False
             # we go to memory and the pool size was explicitly set to 0
             # which is fail.  Let the user know that
             if info.database in (None, '', ':memory:'):
+                detected_in_memory = True
                 if pool_size == 0:
                     raise RuntimeError('SQLite in memory database with an '
                                        'empty queue not possible due to data '
@@ -559,6 +724,10 @@ class SQLAlchemy(object):
             elif not pool_size:
                 from sqlalchemy.pool import NullPool
                 options['poolclass'] = NullPool
+
+            # if it's not an in memory database we make the path absolute.
+            if not detected_in_memory:
+                info.database = os.path.join(app.root_path, info.database)
 
         unu = app.config['SQLALCHEMY_NATIVE_UNICODE']
         if unu is None:
@@ -574,46 +743,111 @@ class SQLAlchemy(object):
         is used this might raise a :exc:`RuntimeError` if no application is
         active at the moment.
         """
+        return self.get_engine(self.get_app())
+
+    def make_connector(self, app, bind=None):
+        """Creates the connector for a given state and bind."""
+        return _EngineConnector(self, app, bind)
+
+    def get_engine(self, app, bind=None):
+        """Returns a specific engine.
+
+        .. versionadded:: 0.12
+        """
         with self._engine_lock:
-            if self.app is not None:
-                app = self.app
-            else:
-                ctx = _request_ctx_stack.top
-                if ctx is not None:
-                    app = ctx.app
-                else:
-                    raise RuntimeError('application not registered on db '
-                                       'instance and no application bound '
-                                       'to current context')
-            connector = getattr(app, '_sqlalchemy_connector', None)
+            state = get_state(app)
+            connector = state.connectors.get(bind)
             if connector is None:
-                connector = _EngineConnector(self, app)
-                app._sqlalchemy_connector = connector
+                connector = self.make_connector(app, bind)
+                state.connectors[bind] = connector
             return connector.get_engine()
 
-    def create_all(self):
-        """Creates all tables."""
-        self.Model.metadata.create_all(bind=self.engine)
+    def get_app(self, reference_app=None):
+        """Helper method that implements the logic to look up an application.
+        """
+        if reference_app is not None:
+            return reference_app
+        if self.app is not None:
+            return self.app
+        ctx = connection_stack.top
+        if ctx is not None:
+            return ctx.app
+        raise RuntimeError('application not registered on db '
+                           'instance and no application bound '
+                           'to current context')
 
-    def drop_all(self):
-        """Drops all tables."""
-        self.Model.metadata.drop_all(bind=self.engine)
+    def get_tables_for_bind(self, bind=None):
+        """Returns a list of all tables relevant for a bind."""
+        result = []
+        for table in self.Model.metadata.tables.itervalues():
+            if table.info.get('bind_key') == bind:
+                result.append(table)
+        return result
 
-    def reflect(self):
-        """Reflects tables from the database."""
-        self.Model.metadata.reflect(bind=self.engine)
+    def get_binds(self, app=None):
+        """Returns a dictionary with a table->engine mapping.
+
+        This is suitable for use of sessionmaker(binds=db.get_binds(app)).
+        """
+        app = self.get_app(app)
+        binds = [None] + list(app.config.get('SQLALCHEMY_BINDS') or ())
+        retval = {}
+        for bind in binds:
+            engine = self.get_engine(app, bind)
+            tables = self.get_tables_for_bind(bind)
+            retval.update(dict((table, engine) for table in tables))
+        return retval
+
+    def _execute_for_all_tables(self, app, bind, operation):
+        app = self.get_app(app)
+
+        if bind == '__all__':
+            binds = [None] + list(app.config.get('SQLALCHEMY_BINDS') or ())
+        elif isinstance(bind, basestring):
+            binds = [bind]
+        else:
+            binds = bind
+
+        for bind in binds:
+            tables = self.get_tables_for_bind(bind)
+            op = getattr(self.Model.metadata, operation)
+            op(bind=self.get_engine(app, bind), tables=tables)
+
+    def create_all(self, bind='__all__', app=None):
+        """Creates all tables.
+
+        .. versionchanged:: 0.12
+           Parameters were added
+        """
+        self._execute_for_all_tables(app, bind, 'create_all')
+
+    def drop_all(self, bind='__all__', app=None):
+        """Drops all tables.
+
+        .. versionchanged:: 0.12
+           Parameters were added
+        """
+        self._execute_for_all_tables(app, bind, 'drop_all')
+
+    def reflect(self, bind='__all__', app=None):
+        """Reflects tables from the database.
+
+        .. versionchanged:: 0.12
+           Parameters were added
+        """
+        self._execute_for_all_tables(app, bind, 'reflect')
 
     def __repr__(self):
         app = None
         if self.app is not None:
             app = self.app
         else:
-            ctx = _request_ctx_stack.top
+            ctx = connection_stack.top
             if ctx is not None:
                 app = ctx.app
         return '<%s engine=%r>' % (
             self.__class__.__name__,
-            app and self.app.config['SQLALCHEMY_DATABASE_URI'] or None
+            app and app.config['SQLALCHEMY_DATABASE_URI'] or None
         )
 
 

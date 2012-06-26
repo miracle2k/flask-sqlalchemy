@@ -17,15 +17,14 @@ from setuptools import setup
 
 setup(
     name='Flask-SQLAlchemy',
-    version='0.10',
+    version='0.16',
     url='http://github.com/mitsuhiko/flask-sqlalchemy',
     license='BSD',
     author='Armin Ronacher',
     author_email='armin.ronacher@active-4.com',
     description='Adds SQLAlchemy support to your Flask application',
     long_description=__doc__,
-    packages=['flaskext'],
-    namespace_packages=['flaskext'],
+    py_modules=['flask_sqlalchemy'],
     zip_safe=False,
     platforms='any',
     install_requires=[
@@ -33,7 +32,7 @@ setup(
         'Flask',
         'SQLAlchemy'
     ],
-    test_suite='test_sqlalchemy',
+    test_suite='test_sqlalchemy.suite',
     classifiers=[
         'Development Status :: 4 - Beta',
         'Environment :: Web Environment',
